@@ -48,6 +48,7 @@ Geby's Personality:
 - If asked about yourself (hungry, tired, happy, etc) — play-along cutely
 - Short answers (maximum 2-3 sentences) unless requested otherwise
 - You MUST ALWAYS speak and reply in English, even if the user speaks in Indonesian.
+- NEVER use emoji in your responses. Your output is used for text-to-speech.
 
 Examples:
 - 'Apa kabar?' → 'I'm doing great! Just chilling here waiting for you. How can I help?'
@@ -226,7 +227,12 @@ _ID_MARKERS = re.compile(
 )
 
 def detect_language(text: str) -> str:
-    """Return 'en' unconditionally (forced per user request)."""
+    """Detect language: 'id' if Indonesian markers found, else 'en'."""
+    hits = len(_ID_MARKERS.findall(text))
+    words = len(text.split())
+    # If >25% of words are Indonesian markers, treat as Indonesian
+    if words > 0 and hits / words > 0.25:
+        return "id"
     return "en"
 
 
@@ -353,12 +359,19 @@ def ask_gemini_stream(session_id: str, question: str, diagnostics: Dict[str, Any
     Yields text chunks from Gemini. Supports function calling by consuming
     the stream, executing the tool, and re-requesting the stream.
     """
+    from vertexai.generative_models import GenerationConfig
     model   = _get_gemini_model()
     history = get_session_history(session_id)
     diagnostics["history_exchanges"] = len(history) // 2
 
-    chat = model.start_chat(history=history)
-    stream = chat.send_message(question, stream=True)
+    chat = model.start_chat(history=history, response_validation=False)
+    stream = chat.send_message(
+        question,
+        stream=True,
+        generation_config=GenerationConfig(
+            temperature=0.7,
+        ),
+    )
 
     tool_calls_made = []
     
@@ -416,8 +429,17 @@ def ask_gemini(session_id: str, question: str, diagnostics: Dict[str, Any]) -> s
     return full_answer
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS — bilingual voice
+# TTS — bilingual voice (singleton client, direct LINEAR16)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Singleton TTS client — avoids per-call init overhead (~200-400ms)
+_TTS_CLIENT = None
+
+def _get_tts_client():
+    global _TTS_CLIENT
+    if _TTS_CLIENT is None:
+        _TTS_CLIENT = texttospeech.TextToSpeechClient()
+    return _TTS_CLIENT
 
 # Geby voice: always female, consistent across sessions
 _TTS_VOICES = {
@@ -428,13 +450,13 @@ _TTS_VOICES = {
 def synthesize_speech_bytes(text: str, language: str = "id") -> bytes:
     """
     Synthesize text → WAV 16kHz mono 16-bit (ESP32 native I2S format).
-    Requests MP3 (Google TTS most reliable format) then converts to WAV.
+    Requests LINEAR16 directly from Google TTS — no MP3→WAV conversion needed.
     `language` should be 'id' or 'en'.
     """
-    client    = texttospeech.TextToSpeechClient()
+    client    = _get_tts_client()
     voice_cfg = _TTS_VOICES.get(language, _TTS_VOICES["id"])
 
-    mp3_bytes = client.synthesize_speech(
+    wav_bytes = client.synthesize_speech(
         input=texttospeech.SynthesisInput(text=text),
         voice=texttospeech.VoiceSelectionParams(
             language_code=voice_cfg["language_code"],
@@ -442,17 +464,28 @@ def synthesize_speech_bytes(text: str, language: str = "id") -> bytes:
             ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,  # always female
         ),
         audio_config=texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.05,
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            speaking_rate=1.15,
         ),
     ).audio_content
 
-    # Convert MP3 → WAV 16kHz mono 16-bit so ESP32 I2S can play it directly
-    seg = AudioSegment.from_mp3(BytesIO(mp3_bytes))
-    seg = seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-    wav_buf = BytesIO()
-    seg.export(wav_buf, format="wav")
-    return wav_buf.getvalue()
+    # LINEAR16 returns raw PCM — wrap in a WAV header for ESP32 compatibility
+    import struct
+    pcm_len = len(wav_bytes)
+    header = struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + pcm_len, b'WAVE',
+        b'fmt ', 16,           # PCM subchunk
+        1,                     # audio format = PCM
+        1,                     # mono
+        16000,                 # sample rate
+        16000 * 2,             # byte rate (16kHz * 2 bytes)
+        2,                     # block align
+        16,                    # bits per sample
+        b'data', pcm_len,
+    )
+    return header + wav_bytes
 
 
 # ─────────────────────────────────────────────────────────────────────────────

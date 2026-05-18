@@ -223,9 +223,8 @@ def _process_audio(sid: str, session_id: str, audio_bytes: bytes):
         # Immediately show what was heard
         _emit(sid, {"type": "stt_result", "text": question})
 
-        # Step 3 & 4 — Ask Gemini, detect language, and stream TTS per sentence
-        lang   = detect_language(question)
-        diagnostics["detected_lang"] = lang
+        # Step 3 — Ask Gemini
+        lang   = "en"  # default, re-detected on answer below
 
         full_answer  = ""
         for chunk_text in ask_gemini_stream(session_id, question, diagnostics):
@@ -234,21 +233,51 @@ def _process_audio(sid: str, session_id: str, audio_bytes: bytes):
         gemini_time = time.time()
         print(f"[{session_id}] Gemini took: {gemini_time - stt_time:.2f}s | Result: {full_answer}")
 
-        # Synthesize entire response at once to preserve perfect intonation
         if not full_answer.strip():
             full_answer = "Maaf."
-            
-        audio_bytes = synthesize_speech_bytes(full_answer, language=lang)
-        tts_time = time.time()
-        print(f"[{session_id}] TTS took: {tts_time - gemini_time:.2f}s")
+
+        # Detect language on the ANSWER (what gets TTS'd, not the question)
+        lang = detect_language(full_answer)
+        diagnostics["detected_lang"] = lang
+        print(f"[{session_id}] Detected lang: {lang}")
+
+        # Step 4 — Sentence-level TTS streaming
+        # Split into sentences, TTS each one, emit audio_ready immediately.
+        # ESP32 starts playing sentence 1 while sentences 2-N are still being TTS'd.
+        raw_sentences = re.split(r'(?<=[.!?])\s+', full_answer)
+        raw_sentences = [s.strip() for s in raw_sentences if s.strip()]
         
-        audio_id, audio_url = cache_audio_bytes(audio_bytes)
-        _emit(sid, {
-            "type":      "audio_ready",
-            "text":      full_answer,
-            "audio_url": audio_url,
-            "audio_id":  audio_id,
-        })
+        # Filter out emoji-only fragments and merge short bits with previous sentence
+        sentences = []
+        for s in raw_sentences:
+            # Skip if only emoji/whitespace/punctuation (no actual words)
+            if not re.search(r'[a-zA-Z0-9]', s):
+                if sentences:
+                    sentences[-1] += " " + s  # append emoji to previous
+                continue
+            # Merge very short fragments with previous to avoid tiny TTS calls
+            if len(s) < 10 and sentences:
+                sentences[-1] += " " + s
+            else:
+                sentences.append(s)
+        
+        if not sentences:
+            sentences = [full_answer]
+
+        tts_start = time.time()
+        for i, sentence in enumerate(sentences):
+            print(f"[{session_id}] TTS sentence {i+1}/{len(sentences)}: \"{sentence[:60]}\"")
+            sent_audio = synthesize_speech_bytes(sentence, language=lang)
+            tts_elapsed = time.time() - tts_start
+            print(f"[{session_id}] TTS sentence {i+1} done in {tts_elapsed:.2f}s ({len(sent_audio)} bytes)")
+
+            audio_id, audio_url = cache_audio_bytes(sent_audio)
+            _emit(sid, {
+                "type":      "audio_ready",
+                "text":      sentence,
+                "audio_url": audio_url,
+                "audio_id":  audio_id,
+            })
 
         append_exchange(session_id, question, full_answer)
 

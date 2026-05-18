@@ -53,7 +53,11 @@ if not YOUR_PROJECT_ID:
     raise ValueError("GOOGLE_CLOUD_PROJECT_ID or GCP_PROJECT_ID environment variable must be set")
 
 vertexai.init(project=YOUR_PROJECT_ID, location=YOUR_VERTEX_AI_LOCATION)
-model = GenerativeModel("gemini-2.5-flash")
+model = GenerativeModel("gemini-2.0-flash-001")
+
+# ── Singleton API clients (avoid per-request init overhead ~200-500ms) ────
+speech_client = speech.SpeechClient()
+tts_client = texttospeech.TextToSpeechClient()
 
 # In-memory session store.
 # WARNING: This is not suitable for production on Cloud Run with multiple
@@ -241,7 +245,8 @@ def handle_audio_chunk(session_id: str, session: dict, chunk: bytes):
     print(f'[WebSocket] Audio chunk: {len(chunk)} bytes, total: {len(accumulator.buffer)} bytes')
 
 def handle_audio_end(session_id: str, session: dict):
-    """Handle audio_end — run full STT → Gemini → TTS pipeline and emit result."""
+    """Handle audio_end — run STT → Gemini → sentence-level TTS streaming."""
+    import re
     print(f'[WebSocket] Audio end for session {session_id}')
     
     accumulator = session.get('audio_accumulator')
@@ -266,8 +271,7 @@ def handle_audio_end(session_id: str, session: dict):
             wf.writeframes(raw_pcm)
         wav_bytes = wav_io.getvalue()
         
-        # ── STT ─────────────────────────────────────────────────────────────
-        speech_client = speech.SpeechClient()
+        # ── STT (uses global singleton client) ────────────────────────────────
         audio_obj = speech.RecognitionAudio(content=wav_bytes)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -282,62 +286,82 @@ def handle_audio_end(session_id: str, session: dict):
         print(f'[WebSocket] STT: "{question}"')
         
         if not question:
-            emit('message', json.dumps({'type': 'error', 'message': 'Tidak ada suara yang terdeteksi'}))
+            emit('message', json.dumps({'type': 'error', 'message': 'Suara tidak terdeteksi. Coba bicara lebih dekat ke mikrofon.'}))
             return
         
         emit('message', json.dumps({'type': 'stt_result', 'text': question}))
         
-        # ── Gemini ──────────────────────────────────────────────────────────
+        # ── Gemini (max_output_tokens limits response length for speed) ─────
+        from vertexai.generative_models import GenerationConfig
         history = load_history(session_id)
         chat = model.start_chat(history=history)
         save_message(session_id, 'user', question)
         
-        prompt = (
-            u"Jawab pertanyaan berikut secara singkat, jelas, dan tidak lebih dari 3 kalimat. "
-            u"Jangan mengulang pertanyaan. "
-            u"Pertanyaan: %s" % question
+        prompt = u"Jawab singkat max 2 kalimat: %s" % question
+        gemini_response = chat.send_message(
+            prompt,
+            generation_config=GenerationConfig(
+                max_output_tokens=100,
+                temperature=0.7,
+            )
         )
-        gemini_response = chat.send_message(prompt)
-        answer = gemini_response.text
+        answer = gemini_response.text.strip()
         save_message(session_id, 'assistant', answer)
-        print(f'[WebSocket] Gemini: "{answer[:80]}"')
+        print(f'[WebSocket] Gemini: "{answer[:120]}"')
         
-        # ── TTS → WAV (ESP32 only understands WAV/PCM) ──────────────────────
-        tts_client = texttospeech.TextToSpeechClient()
-        tts_input  = texttospeech.SynthesisInput(text=answer)
+        # ── Sentence-level TTS streaming ─────────────────────────────────────
+        # Split answer into sentences, TTS each one, emit audio_ready immediately.
+        # ESP32 starts playing sentence 1 while sentences 2-N are still being TTS'd.
+        sentences = re.split(r'(?<=[.!?])\s+', answer)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # If splitting produced nothing useful, treat entire answer as one sentence
+        if not sentences:
+            sentences = [answer]
+        
         voice_params = texttospeech.VoiceSelectionParams(
             language_code="id-ID",
             name="id-ID-Wavenet-A",
             ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
         )
-        # LINEAR16 @ 16kHz — directly playable by the ESP32 firmware
         audio_cfg = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000,
-            speaking_rate=1.0
+            speaking_rate=1.15
         )
-        tts_response = tts_client.synthesize_speech(
-            input=tts_input, voice=voice_params, audio_config=audio_cfg
-        )
-        tts_wav_bytes = tts_response.audio_content  # already a valid WAV file
         
-        audio_id = uuid.uuid4().hex
-        AUDIO_CACHE[audio_id] = {
-            'bytes': tts_wav_bytes,
-            'mime': 'audio/wav',
-            'created_at': datetime.utcnow().isoformat() + 'Z',
-        }
-        while len(AUDIO_CACHE) > AUDIO_CACHE_MAX_ITEMS:
-            del AUDIO_CACHE[next(iter(AUDIO_CACHE))]
+        for i, sentence in enumerate(sentences):
+            print(f'[WebSocket] TTS sentence {i+1}/{len(sentences)}: "{sentence[:60]}"')
+            tts_input = texttospeech.SynthesisInput(text=sentence)
+            tts_response = tts_client.synthesize_speech(
+                input=tts_input, voice=voice_params, audio_config=audio_cfg
+            )
+            tts_wav_bytes = tts_response.audio_content
+            
+            audio_id = uuid.uuid4().hex
+            AUDIO_CACHE[audio_id] = {
+                'bytes': tts_wav_bytes,
+                'mime': 'audio/wav',
+                'created_at': datetime.utcnow().isoformat() + 'Z',
+            }
+            while len(AUDIO_CACHE) > AUDIO_CACHE_MAX_ITEMS:
+                del AUDIO_CACHE[next(iter(AUDIO_CACHE))]
+            
+            audio_url = f"/api/audio/{audio_id}"
+            print(f'[WebSocket] Sentence {i+1} cached: {audio_url} ({len(tts_wav_bytes)} bytes)')
+            
+            # Emit immediately — ESP32 starts playing while next sentences are TTS'd
+            emit('message', json.dumps({
+                'type': 'audio_ready',
+                'text': sentence,
+                'audio_url': audio_url,
+                'audio_mime': 'audio/wav'
+            }))
         
-        audio_url = f"/api/audio/{audio_id}"
-        print(f'[WebSocket] TTS cached at {audio_url} ({len(tts_wav_bytes)} bytes WAV)')
-        
+        # Signal completion
         emit('message', json.dumps({
-            'type': 'result',
-            'answer': answer,
-            'audio_url': audio_url,
-            'audio_mime': 'audio/wav'
+            'type': 'done',
+            'full_answer': answer
         }))
     
     except Exception as e:
@@ -742,12 +766,8 @@ def api_process_audio():
         save_message(session_id, 'user', question)
         save_message(session_id, 'assistant', answer)
 
-        # ── TTS → WAV @ 16kHz for ESP32 ─────────────────────────────────────
-        # Request MP3 (Google TTS primary format), then convert to WAV via pydub
-        import io
-        from pydub import AudioSegment
-        tts_client = texttospeech.TextToSpeechClient()
-        mp3_bytes = tts_client.synthesize_speech(
+        # ── TTS → WAV @ 16kHz for ESP32 (direct LINEAR16, no MP3 conversion) ──
+        tts_wav = tts_client.synthesize_speech(
             input=texttospeech.SynthesisInput(text=answer),
             voice=texttospeech.VoiceSelectionParams(
                 language_code="id-ID",
@@ -755,16 +775,11 @@ def api_process_audio():
                 ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
             ),
             audio_config=texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=16000,
+                speaking_rate=1.15
             )
         ).audio_content
-
-        # Convert MP3 → WAV 16kHz mono 16-bit (native ESP32 I2S format)
-        seg = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
-        seg = seg.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        wav_buf = io.BytesIO()
-        seg.export(wav_buf, format='wav')
-        tts_wav = wav_buf.getvalue()
 
         audio_id = uuid.uuid4().hex
         AUDIO_CACHE[audio_id] = {
